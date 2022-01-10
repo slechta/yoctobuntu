@@ -1,0 +1,7 @@
+version: "3.9"
+services:
+  y:
+    image: "slechta/yoctobuntu:v5"
+    volumes:
+      - /home/pavel/test:/home/builder/test:rw
+    command: sleep infinity
