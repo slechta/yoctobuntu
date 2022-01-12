@@ -1,2 +1,0 @@
-#!/bin/bash
-chown builder:builder /home/builder/yocto-share
