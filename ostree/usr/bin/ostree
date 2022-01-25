@@ -1,0 +1,5 @@
+#!/bin/bash
+realpath=`readlink -fn $0`
+realdir=`dirname $realpath`
+export OSTREE_GRUB2_EXEC=$realdir/../../usr/lib/ostree/ostree-grub-generator
+exec -a "$0" $realdir/ostree.real "$@"

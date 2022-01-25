@@ -1,0 +1,135 @@
+#!/usr/bin/python3
+# it is important not to use /usr/bin/env since yocto python3-native has problems with certificates
+
+__author__      = "Pavel Slechta"
+__copyright__   = "Copyright 2021, ZF Openmatics"
+
+import base64
+import hashlib
+import logging
+import json
+import sys
+import os
+import ssl
+import urllib
+import urllib.parse
+import urllib.request
+from urllib.error import HTTPError
+
+TOKEN_PROVIDER_URL = 'https://login.microsoftonline.com/zfom.onmicrosoft.com/oauth2/token'
+TOKEN_RESOURCE = 'https://vault.azure.net' # which azure resource we need token for
+KEY_URL = 'https://zfom-bi-odc-kv.vault.azure.net/keys/{}/sign?api-version=7.2'
+
+SIGNATURE_LENGTH = 64  # in bytes
+
+def b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode('ascii')
+
+
+def b64url_decode(data: str) -> bytes:
+    # Ask Microsoft about that :)
+    return base64.urlsafe_b64decode(data + '=' * (4 - len(data) % 4))
+
+
+def get_token(resource: str, client_id: str, client_secret: str) -> str:
+    form_data = {
+        'grant_type': 'client_credentials',
+        'scope': 'openid',
+        'resource': resource,
+        'client_id': client_id,
+        'client_secret': client_secret
+    }
+
+    encoded_form_data = urllib.parse.urlencode(form_data).encode('ascii')
+
+    try:
+        response = urllib.request.urlopen(TOKEN_PROVIDER_URL, timeout=15, data=encoded_form_data)
+    except HTTPError as err:
+        try:
+            data = err.read().decode()
+        except ValueError:
+            data = 'unknown'
+        raise RuntimeError(f'Token request failed: {err.code}, {data}')
+
+    response_bytes = response.read()
+    try:
+        response_json = json.loads(response_bytes.decode('ascii'))
+        return response_json['access_token']
+    except (ValueError, UnicodeDecodeError, KeyError):
+        raise RuntimeError(f'Invalid response from token provider')
+
+
+def get_stdin_digest() -> bytes:
+    m = hashlib.sha256()
+    chunk = sys.stdin.buffer.read()
+    while len(chunk) > 0:
+        m.update(chunk)
+        chunk = sys.stdin.buffer.read()
+    return m.digest()
+
+
+def get_keyvault_signature(token: str, key_name: str, digest: bytes) -> bytes:
+    encoded_digest = b64url_encode(digest)
+
+    data = {
+        'alg': 'ES256',
+        'value': encoded_digest
+    }
+
+    post_data = json.dumps(data).encode('ascii')
+
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+    }
+
+    try:
+        request = urllib.request.Request(KEY_URL.format(key_name), data=post_data, headers=headers)
+        response = urllib.request.urlopen(request, timeout=15)
+    except HTTPError as err:
+        try:
+            data = err.read().decode()
+        except ValueError:
+            data = 'unknown'
+        raise RuntimeError(f'Signing request failed: {err.code}, {data}')
+    try:
+        response_bytes = response.read()
+        response_json = json.loads(response_bytes.decode('ascii'))
+        b64encoded_signature = response_json['value']
+        return b64url_decode(b64encoded_signature)
+    except (KeyError, ValueError):
+        raise RuntimeError(f'Invalid response to signing request')
+
+
+def load_config():
+    home = os.getenv('HOME')
+    try:
+        data = json.load(open(os.path.join(home, '.config', 'keyvault-sign', 'config.json'), 'r'))
+    except (OSError, ValueError) as err:
+        raise RuntimeError(f'Cannot read config file: {str(err)}')
+    if not isinstance(data, object) or 'key-id' not in data or 'secret' not in data or 'client-id' not in data:
+        raise RuntimeError(f'Invalid config file or missing configuration key')
+    return data
+
+
+def main():
+    config = load_config()
+    digest = get_stdin_digest()
+    # get bearer token for the vault communication
+    token = get_token(TOKEN_RESOURCE, config['client-id'], config['secret'])
+    # sign data digest
+    signature = get_keyvault_signature(token, config['key-id'], digest)
+
+    if len(signature) != SIGNATURE_LENGTH:
+        raise RuntimeError('Invalid signature length')
+
+    sys.stdout.buffer.write(signature)
+    sys.stdout.flush()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except RuntimeError as err:
+        logging.critical(str(err))
+        sys.exit(1)
